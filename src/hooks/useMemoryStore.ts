@@ -1,307 +1,426 @@
-import { useState, useCallback, useEffect, useRef } from "react";
-import * as api from "../lib/api";
-import { OPENROUTER_API_KEY, OPENROUTER_MODEL } from "../lib/config";
+import {
+  useState,
+  useCallback,
+  useEffect,
+  useRef,
+  useMemo,
+  useSyncExternalStore,
+} from 'react';
+import * as api from '../lib/api';
 import type {
   MemoryEntry,
+  MemoryFilter,
+  MemorySort,
   MemoryStats,
   ConversationMessage,
-  MemoryTier,
-} from "../types";
-import type { OperationEntry, ChatSession } from "../lib/api";
+  Toast,
+  ToastTone,
+} from '../types';
 
-const EMPTY_STATS: MemoryStats = {
-  totalMemories: 0,
-  tierCounts: { sensory: 0, short_term: 0, long_term: 0, episodic: 0, procedural: 0 },
-  avgImportance: 0,
-  consolidationRate: 0,
-  retrievalAccuracy: 0,
-  memoryUtilization: 0,
-};
-
-const SESSION_STORAGE_KEY = "hmm-session-id";
+const SESSION_STORAGE_KEY = 'hmm-session-id';
 
 function generateSessionId(): string {
   return `s-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
+function readSessionId(): string {
+  try {
+    return localStorage.getItem(SESSION_STORAGE_KEY) || generateSessionId();
+  } catch {
+    return generateSessionId();
+  }
+}
+
+// Session id lives outside React so the server can render a stable empty value
+// and the client can hydrate from localStorage without a mismatch.
+const sessionListeners = new Set<() => void>();
+let sessionCache: string | null = null;
+
+function currentSession(): string {
+  if (sessionCache !== null) return sessionCache;
+  if (typeof window === 'undefined') return '';
+  const id = readSessionId();
+  sessionCache = id;
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, id);
+  } catch {
+    /* ignore */
+  }
+  return id;
+}
+
+function subscribeSession(listener: () => void) {
+  sessionListeners.add(listener);
+  return () => {
+    sessionListeners.delete(listener);
+  };
+}
+
+function persistSession(id: string) {
+  sessionCache = id;
+  try {
+    localStorage.setItem(SESSION_STORAGE_KEY, id);
+  } catch {
+    /* ignore */
+  }
+  for (const listener of sessionListeners) listener();
+}
+
+const SORTERS: Record<MemorySort, (a: MemoryEntry, b: MemoryEntry) => number> = {
+  weight: (a, b) => b.weight - a.weight,
+  recent: (a, b) => b.lastAccessed - a.lastAccessed,
+  accessed: (a, b) => b.accessCount - a.accessCount || b.weight - a.weight,
+  edges: (a, b) => b.edgeCount - a.edgeCount || b.weight - a.weight,
+};
+
+function matchesFilter(mem: MemoryEntry, filter: MemoryFilter): boolean {
+  switch (filter) {
+    case 'strong':
+      return mem.weight >= 0.6;
+    case 'steady':
+      return mem.weight >= 0.25 && mem.weight < 0.6;
+    case 'fading':
+      return mem.weight < 0.25;
+    case 'connected':
+      return mem.edgeCount > 0;
+    default:
+      return true;
+  }
+}
+
 export function useMemoryStore() {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
-  const [operations, setOperations] = useState<OperationEntry[]>([]);
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
-  const [stats, setStats] = useState<MemoryStats>(EMPTY_STATS);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [selectedTier, setSelectedTierState] = useState<MemoryTier | "all">("all");
-  const [searchQuery, setSearchQueryState] = useState("");
+  const [isLoadingMemories, setIsLoadingMemories] = useState(true);
+  const [searchQuery, setSearchQueryState] = useState('');
+  const [sort, setSort] = useState<MemorySort>('weight');
+  const [filter, setFilter] = useState<MemoryFilter>('all');
+  const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<Toast[]>([]);
   const [apiConnected, setApiConnected] = useState<boolean | null>(null);
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
 
-  // Current session ID — persisted in localStorage
-  const [sessionId, setSessionIdState] = useState<string>(() => {
-    try {
-      return localStorage.getItem(SESSION_STORAGE_KEY) || generateSessionId();
-    } catch {
-      return generateSessionId();
+  // Empty during SSR, then the stored session once hydrated.
+  const sessionId = useSyncExternalStore(subscribeSession, currentSession, () => '');
+  const sessionIdRef = useRef('');
+
+  const ensureSession = useCallback(() => {
+    const existing = sessionIdRef.current || currentSession();
+    if (existing) {
+      sessionIdRef.current = existing;
+      return existing;
     }
-  });
-  const sessionIdRef = useRef(sessionId);
-
-  const setSessionId = useCallback((id: string) => {
-    setSessionIdState(id);
-    sessionIdRef.current = id;
-    try {
-      localStorage.setItem(SESSION_STORAGE_KEY, id);
-    } catch { /* ignore */ }
+    const created = generateSessionId();
+    sessionIdRef.current = created;
+    persistSession(created);
+    return created;
   }, []);
 
-  // --- Refresh helpers -------------------------------------------------------
+  const setSessionId = useCallback((id: string) => {
+    sessionIdRef.current = id;
+    persistSession(id);
+  }, []);
+
+  // --- Toasts ---------------------------------------------------------------
+
+  const dismissToast = useCallback((id: number) => {
+    setToasts((current) => current.filter((toast) => toast.id !== id));
+  }, []);
+
+  const notify = useCallback(
+    (message: string, tone: ToastTone = 'info') => {
+      const id = Date.now() + Math.random();
+      setToasts((current) => [...current.slice(-2), { id, message, tone }]);
+      window.setTimeout(() => dismissToast(id), 3600);
+    },
+    [dismissToast],
+  );
+
+  // --- Refresh ---------------------------------------------------------------
 
   const refreshMemories = useCallback(async () => {
     try {
       const res = await api.memories.list();
       setMemories(res.memories);
+      setApiConnected(true);
     } catch {
       setApiConnected(false);
+    } finally {
+      setIsLoadingMemories(false);
     }
   }, []);
 
-  const refreshOps = useCallback(async () => {
-    try {
-      const res = await api.stats.operations(100);
-      setOperations(res);
-    } catch { /* ignore */ }
-  }, []);
-
   const refreshMessages = useCallback(async () => {
+    if (!sessionIdRef.current) return;
     try {
       const res = await api.chat.history(sessionIdRef.current, 50);
       setMessages(res);
-    } catch { /* ignore */ }
-  }, []);
-
-  const refreshStats = useCallback(async () => {
-    try {
-      const res = await api.stats.get();
-      setStats(res as MemoryStats);
-    } catch { /* ignore */ }
-  }, []);
-
-  const refreshSessions = useCallback(async () => {
-    try {
-      const res = await api.chat.sessions();
-      setSessions(res);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   const refresh = useCallback(async () => {
-    await Promise.all([
-      refreshMemories(),
-      refreshOps(),
-      refreshMessages(),
-      refreshStats(),
-      refreshSessions(),
-    ]);
-  }, [refreshMemories, refreshOps, refreshMessages, refreshStats, refreshSessions]);
+    await Promise.all([refreshMemories(), refreshMessages()]);
+  }, [refreshMemories, refreshMessages]);
 
-  // --- Connection check + initial load ---------------------------------------
+  // --- Connection check + initial load --------------------------------------
 
+  const connected = apiConnected === true;
+
+  // Probe the backend once on mount, then keep probing every 5 seconds while
+  // disconnected. Without this, one failed request would pin the indicator to
+  // Offline until a reload.
   useEffect(() => {
-    let mounted = true;
-    (async () => {
+    if (connected) return;
+
+    let cancelled = false;
+
+    const probe = async () => {
       try {
         await api.health();
+        if (cancelled) return;
         setApiConnected(true);
-        if (mounted) await refresh();
+        await refresh();
       } catch {
-        setApiConnected(false);
+        if (!cancelled) {
+          setApiConnected(false);
+          setIsLoadingMemories(false);
+        }
       }
-    })();
-    return () => { mounted = false; };
-  }, [refresh]);
+    };
 
-  // Auto-refresh every 5s
+    void probe();
+    const interval = setInterval(probe, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [connected, refresh]);
+
+  // Memories are the only thing that changes behind our back, so poll them.
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (apiConnected) {
-        refreshMemories();
-        refreshOps();
-        refreshStats();
-      }
-    }, 5000);
+    if (!connected) return;
+    const interval = setInterval(refreshMemories, 5000);
     return () => clearInterval(interval);
-  }, [apiConnected, refreshMemories, refreshOps, refreshStats]);
+  }, [connected, refreshMemories]);
 
-  // --- Session management ----------------------------------------------------
-
-  const switchSession = useCallback(async (newSessionId: string) => {
-    setSessionId(newSessionId);
-    // Load messages for the new session
-    try {
-      const res = await api.chat.history(newSessionId, 50);
-      setMessages(res);
-    } catch { /* ignore */ }
-  }, [setSessionId]);
-
-  const startNewChat = useCallback(() => {
-    const newId = generateSessionId();
-    setSessionId(newId);
-    setMessages([]);
-  }, [setSessionId]);
-
-  const deleteSession = useCallback(async (sessionId: string) => {
-    try {
-      await api.chat.deleteSession(sessionId);
-      // If we deleted the current session, start a new one
-      if (sessionId === sessionIdRef.current) {
-        startNewChat();
-      }
-      await refreshSessions();
-    } catch { /* ignore */ }
-  }, [startNewChat, refreshSessions]);
-
-  // --- Process message (chat) ------------------------------------------------
+  // --- Chat ------------------------------------------------------------------
 
   const processMessage = useCallback(
     async (content: string): Promise<string> => {
       setIsProcessing(true);
-      const currentSessionId = sessionIdRef.current;
+      const currentSessionId = ensureSession();
       try {
-        // 1. Send user message to backend
-        const sendRes = await api.chat.send(content, currentSessionId, OPENROUTER_API_KEY);
-
-        // 2. Refresh client state
+        // 1. Store the user message and get the retrieved memory context
+        const sendRes = await api.chat.send(content, currentSessionId);
         await refresh();
 
-        // 3. Call the LLM via OpenRouter with the embedded key
-        const { system, messages: chatHistory } = sendRes.suggestedPrompt;
+        // 2. Call the model through the server-side proxy
+        const { content: assistantContent } = await api.llm.complete(
+          sendRes.suggestedPrompt.system,
+          sendRes.suggestedPrompt.messages,
+        );
 
-        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-            "Content-Type": "application/json",
-            "HTTP-Referer": window.location.origin,
-          },
-          body: JSON.stringify({
-            model: OPENROUTER_MODEL,
-            messages: [
-              { role: "system", content: system },
-              ...chatHistory,
-            ],
-          }),
-        });
-
-        if (!response.ok) throw new Error(`API error: ${response.status}`);
-
-        const data = await response.json();
-        const assistantContent: string =
-          data.choices?.[0]?.message?.content || "No response generated.";
-
-        // 4. Store assistant response
-        await api.chat.respond(assistantContent, currentSessionId);
-
-        // 5. Final refresh
+        // 3. Store the assistant reply, which also creates memories
+        await api.chat.respond(
+          assistantContent || 'No response generated.',
+          currentSessionId,
+        );
         await refresh();
-
         return assistantContent;
       } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : "Unknown error";
+        const errorMsg = err instanceof Error ? err.message : 'Unknown error';
+        notify(errorMsg, 'error');
         try {
           await api.chat.respond(`Error: ${errorMsg}`, currentSessionId);
           await refresh();
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
         return `Error: ${errorMsg}`;
       } finally {
         setIsProcessing(false);
       }
     },
-    [refresh],
+    [refresh, notify, ensureSession],
   );
 
-  // --- Tier & search filtering ------------------------------------------------
+  const clearChat = useCallback(async () => {
+    try {
+      await api.chat.clear(ensureSession());
+      setMessages([]);
+      notify('Conversation cleared', 'success');
+    } catch {
+      notify('Could not clear the conversation', 'error');
+    }
+  }, [notify, ensureSession]);
 
-  const setSelectedTier = useCallback((tier: MemoryTier | "all") => {
-    setSelectedTierState(tier);
-  }, []);
+  const startNewChat = useCallback(() => {
+    const id = generateSessionId();
+    sessionIdRef.current = id;
+    persistSession(id);
+    setMessages([]);
+    notify('Started a new conversation', 'success');
+  }, [notify]);
+
+  // --- Search / sort / filter ------------------------------------------------
 
   const setSearchQuery = useCallback((query: string) => {
     setSearchQueryState(query);
   }, []);
 
-  const filteredMemories = memories.filter((mem) => {
-    const tierMatch = selectedTier === "all" || mem.tier === selectedTier;
-    const queryMatch =
-      searchQuery === "" ||
-      mem.content.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      mem.tags.some((t) => t.toLowerCase().includes(searchQuery.toLowerCase()));
-    return tierMatch && queryMatch;
-  });
+  const searchedMemories = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return memories;
+    return memories.filter(
+      (mem) =>
+        mem.content.toLowerCase().includes(query) ||
+        mem.tags.some((tag) => tag.toLowerCase().includes(query)),
+    );
+  }, [memories, searchQuery]);
+
+  const filterCounts = useMemo<Record<MemoryFilter, number>>(
+    () => ({
+      all: searchedMemories.length,
+      strong: searchedMemories.filter((m) => matchesFilter(m, 'strong')).length,
+      steady: searchedMemories.filter((m) => matchesFilter(m, 'steady')).length,
+      fading: searchedMemories.filter((m) => matchesFilter(m, 'fading')).length,
+      connected: searchedMemories.filter((m) => matchesFilter(m, 'connected'))
+        .length,
+    }),
+    [searchedMemories],
+  );
+
+  const filteredMemories = useMemo(() => {
+    return searchedMemories
+      .filter((mem) => matchesFilter(mem, filter))
+      .sort(SORTERS[sort]);
+  }, [searchedMemories, filter, sort]);
+
+  const stats = useMemo<MemoryStats>(
+    () => ({ totalMemories: memories.length }),
+    [memories],
+  );
+
+  const strongest = useMemo(
+    () => memories.reduce<MemoryEntry | null>((best, mem) => (!best || mem.weight > best.weight ? mem : best), null),
+    [memories],
+  );
+
+  const totalEdges = useMemo(
+    () => Math.round(memories.reduce((sum, mem) => sum + mem.edgeCount, 0) / 2),
+    [memories],
+  );
+
+  const avgWeight = useMemo(
+    () =>
+      memories.length === 0
+        ? 0
+        : memories.reduce((sum, mem) => sum + mem.weight, 0) / memories.length,
+    [memories],
+  );
+
+  const selectedMemory = useMemo(
+    () => memories.find((mem) => mem.id === selectedMemoryId) ?? null,
+    [memories, selectedMemoryId],
+  );
+
+  const memoryById = useMemo(() => {
+    const map = new Map<string, MemoryEntry>();
+    for (const mem of memories) map.set(mem.id, mem);
+    return map;
+  }, [memories]);
+
+  const selectMemory = useCallback((id: string | null) => {
+    setSelectedMemoryId(id);
+  }, []);
 
   // --- Actions ---------------------------------------------------------------
 
-  const manualAssociate = useCallback(
-    async (idA: string, idB: string) => {
-      try {
-        await api.memories.associate(idA, idB);
-        await refresh();
-      } catch { /* ignore */ }
-    },
-    [refresh],
-  );
-
   const manualPrune = useCallback(async () => {
     try {
-      await api.memories.prune();
+      const { pruned } = await api.memories.prune();
       await refresh();
-    } catch { /* ignore */ }
-  }, [refresh]);
-
-  const manualConsolidate = useCallback(async () => {
-    try {
-      await api.memories.consolidate();
-      await refresh();
-    } catch { /* ignore */ }
-  }, [refresh]);
+      notify(
+        pruned === 0
+          ? 'Nothing to prune — every memory still carries weight'
+          : `Pruned ${pruned} faded ${pruned === 1 ? 'memory' : 'memories'}`,
+        'success',
+      );
+      return pruned;
+    } catch {
+      notify('Prune failed — check the backend', 'error');
+      return 0;
+    }
+  }, [refresh, notify]);
 
   const createManualMemory = useCallback(
-    async (content: string, tier: MemoryTier, importance: number, tags: string[]) => {
+    async (content: string, importance: number, tags: string[]) => {
       try {
-        await api.memories.create({ content, tier, importance, tags });
+        await api.memories.create({ content, importance, tags });
         await refresh();
-      } catch { /* ignore */ }
+        notify('Memory added', 'success');
+        return true;
+      } catch {
+        notify('Could not add the memory', 'error');
+        return false;
+      }
     },
-    [refresh],
+    [refresh, notify],
   );
 
-  const clearChat = useCallback(async () => {
-    try {
-      await api.chat.clear(sessionIdRef.current);
-      await refresh();
-    } catch { /* ignore */ }
-  }, [refresh]);
+  const deleteMemory = useCallback(
+    async (uid: string) => {
+      // Optimistic removal keeps the list responsive; the poll will restore it
+      // if the delete actually failed.
+      const previous = memories;
+      setMemories((current) => current.filter((mem) => mem.id !== uid));
+      if (selectedMemoryId === uid) setSelectedMemoryId(null);
+      try {
+        await api.memories.delete(uid);
+        notify('Memory forgotten', 'success');
+      } catch {
+        setMemories(previous);
+        notify('Could not delete the memory', 'error');
+      }
+    },
+    [memories, selectedMemoryId, notify],
+  );
 
   return {
     memories,
-    operations,
+    filteredMemories,
+    searchedMemories,
+    filterCounts,
     messages,
     stats,
+    strongest,
+    totalEdges,
+    avgWeight,
     isProcessing,
-    selectedTier,
+    isLoadingMemories,
     searchQuery,
-    filteredMemories,
+    sort,
+    filter,
+    selectedMemory,
+    memoryById,
+    toasts,
     apiConnected,
-    sessions,
     sessionId,
     processMessage,
-    setSelectedTier,
     setSearchQuery,
-    manualAssociate,
+    setSort,
+    setFilter,
+    selectMemory,
+    setSessionId,
     manualPrune,
-    manualConsolidate,
     createManualMemory,
+    deleteMemory,
     clearChat,
     startNewChat,
-    switchSession,
-    deleteSession,
+    notify,
+    dismissToast,
     refresh,
   };
 }

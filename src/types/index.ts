@@ -1,40 +1,23 @@
-export type MemoryTier = 'sensory' | 'short_term' | 'long_term' | 'episodic' | 'procedural';
-
 export interface MemoryEntry {
   id: string;
-  tier: MemoryTier;
   content: string;
-  embedding?: number[];
-  importance: number; // 0-1
+  weight: number; // emergent 0-1; rises with use, decays with time
+  edgeCount: number;
+  importance: number; // authored seed 0-1
   accessCount: number;
   lastAccessed: number;
   createdAt: number;
-  decayRate: number;
   tags: string[];
   metadata: Record<string, unknown>;
-  associations: string[]; // IDs of related memories
-  consolidated: boolean;
-}
-
-export interface TierCounts {
-  sensory: number;
-  short_term: number;
-  long_term: number;
-  episodic: number;
-  procedural: number;
 }
 
 export interface MemoryStats {
   totalMemories: number;
-  tierCounts: TierCounts;
-  avgImportance: number;
-  consolidationRate: number;
-  retrievalAccuracy: number;
-  memoryUtilization: number;
 }
 
 export interface ConversationMessage {
   id: string;
+  sessionId: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: number;
@@ -42,22 +25,14 @@ export interface ConversationMessage {
   memoriesCreated: string[];
 }
 
-export interface MemoryOperation {
-  id: string;
-  type: 'create' | 'consolidate' | 'decay' | 'retrieve' | 'associate' | 'prune';
-  sourceTier: MemoryTier;
-  targetTier?: MemoryTier | null;
-  memoryId: string;
-  timestamp: number;
-  details: string;
-}
+export type MemorySort = 'weight' | 'recent' | 'accessed' | 'edges';
 
-export interface AppState {
-  messages: ConversationMessage[];
-  operations: MemoryOperation[];
-  memories: MemoryEntry[];
-  stats: MemoryStats;
-  isProcessing: boolean;
-  selectedTier: MemoryTier | 'all';
-  searchQuery: string;
+export type MemoryFilter = 'all' | 'strong' | 'steady' | 'fading' | 'connected';
+
+export type ToastTone = 'info' | 'success' | 'error';
+
+export interface Toast {
+  id: number;
+  message: string;
+  tone: ToastTone;
 }

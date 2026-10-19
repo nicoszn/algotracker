@@ -1,4 +1,15 @@
-.env.local
 node_modules
+.next
+out
 dist
-src/convex/_generated
+*.db
+__pycache__/
+*.pyc
+.DS_Store
+next-env.d.ts
+
+# python
+.venv/
+
+# typescript incremental build info
+*.tsbuildinfo
